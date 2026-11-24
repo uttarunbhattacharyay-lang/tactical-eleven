@@ -2,6 +2,8 @@
 
 Real-time tactical football draft + live managerial match simulation. Deterministic 2D spatial engine (no dice rolls), IFAB-based rules (offside, fouls, cards, penalties, all restarts, stoppage time, 5 subs / 3 windows + half-time).
 
+**Play it:** https://tactical-eleven.vercel.app (vs CPU; online multiplayer needs the Socket.io server, see below). Every push to `main` redeploys automatically.
+
 ## Run
 
 ```bash
