@@ -4,6 +4,14 @@ import { ROLE_MAP, STRATS, type RoleDef } from '../formations';
 import { laneClear } from './spatial';
 import type { Match } from './engine';
 
+/** Expected-threat style value of having the ball at (x, y) for a team attacking towards dirv (goal probability of the possession). */
+export function threatAt(dirv: number, x: number, y: number): number {
+  const gx = dirv === 1 ? L : 0;
+  const d = Math.hypot(gx - x, 34 - y);
+  const central = 1 - Math.min(1, Math.abs(y - 34) / 30);
+  return 0.004 + 0.2 * Math.exp(-d / 11) * (0.55 + 0.45 * central);
+}
+
 export interface AgentStats { passes: number; passesOk: number; shots: number; goals: number; tackles: number; intercepts: number; fouls: number; dist: number }
 
 type Opt =
@@ -215,39 +223,54 @@ export class PlayerAgent {
     return clamp(Math.round(sec / m.dtp), 1, 14);
   }
 
+  /**
+   * On-ball decision. Every option is valued in the same currency: the chance that this possession ends in a goal
+   * (an "expected threat" model, as used in football analytics), minus the danger of losing the ball where it goes.
+   * The player's own attributes and role then colour how he sees and weighs those options.
+   */
   decide(m: Match) {
-    const t = this.team, tac = m.tactics[t], mods = STRATS[tac.strategy], role = this.role(m), dirv = m.dir[t];
+    const t = this.team, opp = (1 - t) as TeamId, tac = m.tactics[t], mods = STRATS[tac.strategy], role = this.role(m), dirv = m.dir[t];
     const gx = dirv === 1 ? L : 0;
     const press = m.pressureAt(this.x, this.y, t);
     const depth = m.depthOf(t, this.x);
     const vis = this.eff('passing');
     const comp = this.eff('composure');
-    const trN = m.trans[t];
-    const direct = clamp(0.5 + mods.direct + (tac.buildUp === 'direct' ? 0.3 : tac.buildUp === 'short' ? -0.25 : 0) + role.risk * 0.3
-      + (trN.kind === 'won' && trN.ticks > 0 && tac.transition === 'counterattack' ? 0.3 : 0), 0.15, 1.35);
-    const opts: Opt[] = [];
-    const dGoal = Math.hypot(gx - this.x, 34 - this.y);
     const sk = this.card.skills;
     const fin = sk.finishing / 100;
-    // shooting instinct: natural finishers look for goal, the role scales it (an anchor rarely shoots, a poacher always does)
-    const instinct = role.shoot * (0.3 + 0.95 * fin + 0.1 * comp);
-    // space in front of the carrier (towards goal)
-    let free = 20;
-    for (const o of m.spBy[1 - t]) { const ox = (o.x - this.x) * dirv; if (ox > -1) free = Math.min(free, Math.hypot(o.x - this.x, o.y - this.y)); }
+    const trN = m.trans[t];
+    const counter = trN.kind === 'won' && trN.ticks > 0 && tac.transition === 'counterattack';
+    // team style: how much a forward ball is worth vs keeping it
+    const direct = clamp(0.5 + mods.direct + (tac.buildUp === 'direct' ? 0.3 : tac.buildUp === 'short' ? -0.25 : 0) + (counter ? 0.3 : 0), 0.15, 1.35);
+    const ambition = 0.85 + 0.3 * direct + 0.25 * role.risk; // weight on the value of where the ball goes
+    // fear of losing it: careful roles and short build-up fear it more; low composure under pressure = panic
+    const caution = clamp(1.6 - 0.45 * role.risk - 0.35 * (direct - 0.5) + press * (1 - comp) * 0.8, 0.8, 2.4);
+    const noise = 0.012 * (1 - 0.75 * vis); // how clearly he reads the picture
+    const here = threatAt(dirv, this.x, this.y);
+    const oc = here * 0.75; // opportunity cost: a failed action throws away the attack we already have
+    const TO = 0.026; // a turnover also sets the opponent off on a counter while we are out of shape
+    const opts: Opt[] = [];
 
+    // ---- shot
+    const dGoal = Math.hypot(gx - this.x, 34 - this.y);
     let shotXg = 0;
-    const range = 16 + 13 * fin; // good finishers try it from further out
-    if (!this.isGK && depth > 0.6 && dGoal < range) {
+    if (!this.isGK && dGoal < 34) {
       shotXg = m.xgAt(this, this.x, this.y, false, press);
-      let u = shotXg * 1.75 * instinct * (0.8 + 0.4 * direct) - 0.045;
-      if (dGoal < 12) u += 0.03 + 0.06 * fin; // in and around the six-yard box you hit it
-      if (dGoal >= 16 && shotXg > 0.025) {
-        // a sight of goal from range: players who can strike a ball fancy it (Bellingham will, Rodri rarely)
-        const urge = clamp(0.4 * (fin - 0.55) / 0.35, 0, 0.45) * role.shoot * (free > 5 ? 1 : 0.35);
-        if (m.rng.next() < urge) u += 0.45;
-      } // a sight of goal from range: shooters take it on
+      // shooting instinct: finishers back themselves, the role scales it (a poacher always, an anchor rarely)
+      const selfish = clamp(role.shoot * (0.4 + 0.6 * fin), 0.3, 1.1);
+      // bodies in the way: players see the shooting lane and don't blast into a wall
+      let wall = 0;
+      for (const o of m.spBy[opp]) {
+        const along = ((o.x - this.x) * (gx - this.x) + (o.y - this.y) * (34 - this.y)) / (dGoal * dGoal + 1e-6);
+        if (along < 0.04 || along > 0.95) continue;
+        if (Math.hypot(o.x - (this.x + (gx - this.x) * along), o.y - (this.y + (34 - this.y) * along)) < 1.6) wall++;
+      }
+      let u = shotXg * selfish * Math.max(0.35, 1 - 0.22 * wall) + 0.002 - (1 - shotXg) * oc * 0.8; // + a little for rebounds / corners, minus the attack given up
+      if (dGoal > 16) u -= 0.026 * clamp(1.5 - fin - 0.3 * role.shoot, 0.2, 1.2); // speculative efforts: only real shooters try them
+      if (dGoal > 16 && m.rng.next() < clamp((fin - 0.6) * 0.8, 0, 0.25) * role.shoot) u += 0.02; // "he fancies it from there"
       opts.push({ k: 'shot', u });
     }
+
+    // ---- passes
     const mates = m.onPitchOf(t).filter((o) => o !== this);
     for (const r of mates) {
       const tx = clamp(r.x + r.vx * 0.9, 1, L - 1), ty = clamp(r.y + r.vy * 0.9, 1, W - 1);
@@ -255,53 +278,78 @@ export class PlayerAgent {
       if (dist < 4 || dist > 68) continue;
       const progX = (tx - this.x) * dirv;
       const kind: 'pass' | 'through' | 'long' = dist > 36 ? 'long' : progX > 9 && !r.isGK ? 'through' : 'pass';
+      // an attacker high up the pitch does not even look at a long ball back to his own defence
+      if (this.slot > 4 && depth > 0.5 && progX < -18) continue;
       if (m.rules.wouldBeOffside(r, this, tx)) { if (m.rng.next() < 0.45 + 0.5 * vis) continue; }
       // vision: only creative passers reliably spot the through ball or the long switch
-      if (kind !== 'pass' && m.rng.next() > 0.3 + 0.75 * vis) continue;
+      if (kind !== 'pass' && progX > 0 && m.rng.next() > 0.3 + 0.75 * vis) continue;
       const p = m.passEstimate(this, tx, ty, kind);
-      const dT = m.depthOf(t, tx);
-      const progress = dT - depth;
-      const space = m.spatial.at(t, tx, ty);
       const pT = m.pressureAt(tx, ty, t);
-      let threat = dT > 0.62 ? m.xgAt(r, tx, ty, false, pT * 0.6) : 0;
-      // a lay-off to a free team-mate arriving at the edge of the box who can strike a ball
-      if (threat > 0.02 && pT < 0.35) threat *= 1 + 1.6 * Math.max(0, r.card.skills.finishing / 100 - 0.6) * (ROLE_MAP[tac.roles[r.slot]]?.shoot ?? 1);
-      let u = p * (progress * 1.15 * direct * 2.0 + 0.2 * space + 2.4 * threat + 0.1) - (1 - p) * (0.3 + 0.55 * (1 - dT));
-      u += role.risk * progress * 0.4;
-      if (press > 0.6 && dGoal > 20) u += 0.12 * p; // recycling under pressure is for the build-up, not the box
-      // giving up a shooting chance to go backwards: forwards hate it, the better the finisher the more
-      if (shotXg > 0.03 && progX < 0) u -= shotXg * 3 * (0.4 + fin) * role.shoot + 0.03;
-      u += (m.rng.next() - 0.5) * 0.3 * (1 - vis * 0.7);
-      if (r.isGK && !this.isGK) u -= 0.05;
+      // what the ball is worth at his feet: the pitch value there, or his own chance if he can shoot from there
+      let val = threatAt(dirv, tx, ty);
+      const rRole = ROLE_MAP[tac.roles[r.slot]] ?? ROLE_MAP.cb;
+      if (!r.isGK && Math.hypot(gx - tx, 34 - ty) < 26) {
+        const rx = m.xgAt(r, tx, ty, false, pT * 0.7);
+        val = Math.max(val, rx * clamp(rRole.shoot * (0.55 + 0.6 * r.card.skills.finishing / 100), 0.35, 1.3));
+      }
+      val *= clamp(1 - 0.45 * pT * (1.1 - r.eff('touch')), 0.5, 1); // a receiver under pressure may not keep it
+      if (r.isGK) val *= 0.5; // keeper ball: safe but kills the attack
+      // going backwards hands the opponent time to reset: the further back, the more of the attack is lost.
+      // Attackers don't hit long balls back to their own defence.
+      if (progX < 0 && this.slot > 4) {
+        val *= 1 - clamp(-progX / 45, 0, 0.6);
+        if (kind === 'long') val *= 0.35;
+        if (r.slot >= 1 && r.slot <= 4 && depth > 0.55) val *= 0.6;
+      }
+      const lose = threatAt(-dirv, tx, ty); // what the opponent gets if it's cut out there
+      let u = p * val * ambition - (1 - p) * (lose * caution * 1.6 + oc * caution + TO * caution);
+      if (counter && progX > 8) u += 0.006 * p; // break with pace
+      u += m.rng.gauss() * noise;
       opts.push({ k: 'pass', u, r, tx, ty, kind });
     }
-    // cross
-    if (!this.isGK && depth > 0.7 && Math.abs(this.y - 34) > 14) {
+
+    // ---- cross into the box (value from the best header in there)
+    if (!this.isGK && depth > 0.68 && Math.abs(this.y - 34) > 12) {
       const cx = gx - dirv * 10.5, cy = 34 + (this.y > 34 ? -1 : 1) * 2.5;
       const inBox = mates.filter((o) => Math.hypot(o.x - cx, o.y - cy) < 9);
-      const box = inBox.length;
-      const air = inBox.reduce((mx, o) => Math.max(mx, o.card.skills.aerial / 100), 0); // a target man in the box invites the cross
-      const def = m.onPitchOf(1 - t as TeamId).filter((o) => Math.hypot(o.x - cx, o.y - cy) < 7).length;
-      if (box > 0) {
-        const pArr = clamp(0.3 + 0.45 * vis - 0.15 * press, 0.1, 0.85);
-        opts.push({ k: 'cross', u: pArr * (0.085 * box + 0.12 * Math.max(0, air - 0.6) - 0.025 * def + 0.05) * 1.8 * (0.8 + role.risk * 0.3) + (role.ipOut > 0 ? 0.04 : 0), tx: cx, ty: cy });
+      const def = m.onPitchOf(opp).filter((o) => Math.hypot(o.x - cx, o.y - cy) < 8).length;
+      if (inBox.length) {
+        const pArr = clamp(0.25 + 0.5 * vis - 0.15 * press, 0.1, 0.85); // crossing quality
+        let best = 0;
+        for (const o of inBox) {
+          const win = clamp(0.25 + 0.6 * (o.card.skills.aerial / 100 - 0.5) + 0.12 * (inBox.length - def), 0.08, 0.8);
+          best = Math.max(best, win * m.xgAt(o, cx, cy, true, 0.3));
+        }
+        const u = pArr * best * (0.9 + 0.4 * (role.ipOut > 0 ? 1 : 0) + 0.2 * role.risk) * ambition + 0.004 - (1 - pArr * 0.5) * oc * 0.6 + m.rng.gauss() * noise;
+        opts.push({ k: 'cross', u, tx: cx, ty: cy });
       }
     }
+
+    // ---- keep it: carry / shield / take a man on
     if (!this.isGK) {
       const dribSkill = this.eff('touch') * 0.5 + this.eff('pace') * 0.3 + comp * 0.2;
-      const pD = clamp(0.4 + 0.4 * dribSkill - 0.4 * press, 0.12, 0.9);
-      let u = pD * (0.1 + 0.1 * role.dribble * (free > 6 ? 1 : 0.3)) - (1 - pD) * 0.16 + 0.01;
-      // flair: elite dribblers take their man on in the final third; clumsy players don't try
-      if (depth > 0.55) u += 0.55 * Math.max(-0.05, dribSkill - 0.72) * role.dribble * (free < 8 ? 1 : 0.6);
+      const pKeep = clamp(0.45 + 0.5 * dribSkill - 0.38 * press + role.hold * 0.4, 0.1, 0.95);
+      const carryX = clamp(this.x + dirv * 6, 1, L - 1);
+      const ahead = threatAt(dirv, carryX, this.y + (34 - this.y) * 0.25);
+      let u = pKeep * Math.max(ahead, here) * ambition - (1 - pKeep) * (threatAt(-dirv, this.x, this.y) * caution * 1.6 + oc * caution + TO * caution * 0.8);
+      // flair: elite dribblers back themselves against a defender in the final third
+      if (depth > 0.55) u += 0.012 * (dribSkill - 0.72) * role.dribble * 3;
+      u += m.rng.gauss() * noise * 0.5;
       opts.push({ k: 'dribble', u });
     }
-    if (depth < 0.3 && press > 0.7) opts.push({ k: 'clear', u: 0.2 });
+
+    // ---- clearance: under real pressure near your own goal, get rid of it
+    if ((depth < 0.33 && press > 0.6) || this.isGK) {
+      const land = threatAt(dirv, clamp(this.x + dirv * 45, 1, L - 1), 34);
+      opts.push({ k: 'clear', u: 0.45 * land - 0.55 * land * 0.5 - 0.002 });
+    }
+    void here;
 
     let best = opts[0];
     for (const o of opts) if (o.u > best.u) best = o;
     if (!best) { this.think = 3; return; }
     if (best.k === 'dribble') { this.think = Math.max(2, Math.round(0.5 / m.dtp)); return; }
-    if (this.isGK && best.k === 'pass' && best.u < 0.02) { this.think = 3; return; }
+    if (this.isGK && best.k === 'clear' && m.rng.next() < 0.6) { this.think = 3; return; } // keeper waits for an option before going long
     switch (best.k) {
       case 'shot': m.kickShot(this, 'foot'); break;
       case 'pass': m.kickPass(this, best.kind, best.tx, best.ty, best.r); break;
